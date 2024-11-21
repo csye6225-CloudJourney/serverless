@@ -1,10 +1,7 @@
 import os
-import boto3
-import psycopg2
 import json
-from datetime import datetime, timedelta
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
+from sendgrid.helpers.mail import Mail, Header
 import logging
 
 # Configure logging
@@ -12,90 +9,121 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Load environment variables
-DB_HOST = os.getenv("DB_HOST")
-DB_USERNAME = os.getenv("DB_USERNAME")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_NAME = os.getenv("DB_NAME")
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+ENV_PREFIX = os.getenv("ENV_PREFIX", "").strip()
 
-# Function to connect to the database
-def connect_to_database():
-    return psycopg2.connect(
-        host=DB_HOST,
-        user=DB_USERNAME,
-        password=DB_PASSWORD,
-        dbname=DB_NAME
-    )
+# Adjust domain prefix
+if ENV_PREFIX:
+    domain_prefix = f"{ENV_PREFIX}."
+else:
+    domain_prefix = ""
 
-# Function to send email
 def send_verification_email(email, verification_link):
     try:
+        # Email content
+        subject = "Verify Your Email Address"
+        plain_text_content = f"""
+Dear User,
+
+Thank you for signing up. Please verify your email address by clicking the link below:
+{verification_link}
+
+This link will expire in 2 minutes. If you did not sign up, please ignore this email.
+
+To manage your email preferences or unsubscribe, please visit:
+https://{domain_prefix}cloudjourney.me/unsubscribe
+
+Regards,
+The CloudJourney Team
+"""
+        html_content = f"""
+<html>
+    <body>
+        <p>Dear User,</p>
+        <p>Thank you for signing up. Please verify your email address by clicking the link below:</p>
+        <p><a href="{verification_link}">{verification_link}</a></p>
+        <p>This link will expire in 2 minutes. If you did not sign up, please ignore this email.</p>
+        <p>To manage your email preferences or unsubscribe, please click <a href="https://{domain_prefix}cloudjourney.me/unsubscribe">here</a>.</p>
+        <p>Regards,<br>The CloudJourney Team</p>
+    </body>
+</html>
+"""
+
+        # Create SendGrid email
         message = Mail(
-            from_email="noreply@yourdomain.com",
+            from_email='noreply@em7116.cloudjourney.me',  # Ensure this email is verified in SendGrid
             to_emails=email,
-            subject="Verify Your Email",
-            html_content=f"""
-            <p>Click the link below to verify your email:</p>
-            <a href="{verification_link}">{verification_link}</a>
-            <p>This link will expire in 2 minutes.</p>
-            """
+            subject=subject,
+            plain_text_content=plain_text_content,
+            html_content=html_content
         )
+
+        # Add List-Unsubscribe header
+        list_unsubscribe_email = "mailto:unsubscribe@em7116.cloudjourney.me"
+        list_unsubscribe_url = f"https://{domain_prefix}cloudjourney.me/unsubscribe"
+        unsubscribe_header = Header(
+            "List-Unsubscribe",
+            f"<{list_unsubscribe_email}>, <{list_unsubscribe_url}>"
+        )
+        message.personalizations[0].add_header(unsubscribe_header)
+
+        # Send email using SendGrid
         sg = SendGridAPIClient(SENDGRID_API_KEY)
-        sg.send(message)
-        logger.info(f"Verification email sent to {email}")
+        response = sg.send(message)
+        logger.info(f"Email sent to {email}, status code: {response.status_code}")
+        logger.debug(f"Response headers: {response.headers}")
+
+        if response.status_code != 202:
+            logger.error(f"SendGrid API Error: {response.status_code} - {response.body}")
+            return False
+
         return True
     except Exception as e:
-        logger.error(f"Error sending email: {e}")
+        logger.error(f"Exception when sending email: {e}")
         return False
-
-# Lambda Handler
+    
 def lambda_handler(event, context):
     logger.info(f"Received event: {json.dumps(event)}")
 
-    # Parse SNS event
     try:
-        sns_message = event['Records'][0]['Sns']['Message']
-        payload = json.loads(sns_message)
-        email = payload["email"]
-        user_id = payload["user_id"]
-    except (KeyError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to parse SNS message: {e}")
+        # Check if event is from SNS
+        if 'Records' in event:
+            sns_message = event['Records'][0]['Sns']['Message']
+            payload = json.loads(sns_message)
+        else:
+            # Direct invocation
+            payload = event
+        
+        # Extract email and verification token
+        email = payload.get("email")
+        verification_token = payload.get("verification_token")
+
+        if not email or not verification_token:
+            raise ValueError("Missing required fields: email or verification_token")
+    except Exception as e:
+        logger.error(f"Error parsing message: {e}")
         return {
             "statusCode": 400,
-            "body": json.dumps({"message": "Invalid SNS message"})
+            "body": json.dumps({"message": "Invalid event format"})
         }
 
-    # Generate verification link
-    expiration_time = datetime.utcnow() + timedelta(minutes=2)
-    verification_token = f"{user_id}:{expiration_time.isoformat()}"
-    verification_link = f"https://yourdomain.com/verify?token={verification_token}"
+    # Construct verification link
+    try:
+        # Ensure no trailing period if ENV_PREFIX is empty
+        verification_link = f"http://{domain_prefix}cloudjourney.me/verify?token={verification_token}"
+        logger.info(f"Constructed verification link for email: {email}")
+    except Exception as e:
+        logger.error(f"Error constructing verification link: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"message": "Failed to construct verification link"})
+        }
 
     # Send the email
-    email_sent = send_verification_email(email, verification_link)
-    if not email_sent:
+    if not send_verification_email(email, verification_link):
         return {
             "statusCode": 500,
             "body": json.dumps({"message": "Failed to send verification email"})
-        }
-
-    # Log the email to the database
-    try:
-        conn = connect_to_database()
-        cursor = conn.cursor()
-        query = """
-            INSERT INTO email_verification (user_id, email, verification_token, expiration_time, is_verified)
-            VALUES (%s, %s, %s, %s, %s)
-        """
-        cursor.execute(query, (user_id, email, verification_token, expiration_time, False))
-        conn.commit()
-        cursor.close()
-        conn.close()
-        logger.info(f"Email logged successfully for user_id: {user_id}")
-    except Exception as e:
-        logger.error(f"Database error: {e}")
-        return {
-            "statusCode": 500,
-            "body": json.dumps({"message": "Failed to log email in database"})
         }
 
     return {
