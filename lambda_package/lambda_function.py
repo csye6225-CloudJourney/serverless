@@ -1,15 +1,15 @@
 import os
 import json
+import boto3
+import logging
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Header
-import logging
 
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Load environment variables
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 ENV_PREFIX = os.getenv("ENV_PREFIX", "").strip()
 
 # Adjust domain prefix
@@ -18,7 +18,7 @@ if ENV_PREFIX:
 else:
     domain_prefix = ""
 
-def send_verification_email(email, verification_link):
+def send_verification_email(email, verification_link, sendgrid_api_key):
     try:
         # Email content
         subject = "Verify Your Email Address"
@@ -51,7 +51,7 @@ The CloudJourney Team
 
         # Create SendGrid email
         message = Mail(
-            from_email='noreply@em7116.cloudjourney.me',  # Ensure this email is verified in SendGrid
+            from_email='noreply@em7116.cloudjourney.me',
             to_emails=email,
             subject=subject,
             plain_text_content=plain_text_content,
@@ -68,7 +68,7 @@ The CloudJourney Team
         message.personalizations[0].add_header(unsubscribe_header)
 
         # Send email using SendGrid
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        sg = SendGridAPIClient(sendgrid_api_key)
         response = sg.send(message)
         logger.info(f"Email sent to {email}, status code: {response.status_code}")
         logger.debug(f"Response headers: {response.headers}")
@@ -81,9 +81,25 @@ The CloudJourney Team
     except Exception as e:
         logger.error(f"Exception when sending email: {e}")
         return False
-    
+
 def lambda_handler(event, context):
     logger.info(f"Received event: {json.dumps(event)}")
+
+    # Initialize AWS Secrets Manager client
+    secrets_client = boto3.client('secretsmanager')
+
+    # Retrieve the SendGrid API Key from Secrets Manager
+    try:
+        secret_response = secrets_client.get_secret_value(
+            SecretId='sendgrid_api_key_secret'
+        )
+        sendgrid_api_key = secret_response['SecretString']
+    except Exception as e:
+        logger.error(f"Error retrieving SendGrid API Key from Secrets Manager: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"message": "Failed to retrieve SendGrid API Key"})
+        }
 
     try:
         # Check if event is from SNS
@@ -93,7 +109,7 @@ def lambda_handler(event, context):
         else:
             # Direct invocation
             payload = event
-        
+
         # Extract email and verification token
         email = payload.get("email")
         verification_token = payload.get("verification_token")
@@ -109,7 +125,6 @@ def lambda_handler(event, context):
 
     # Construct verification link
     try:
-        # Ensure no trailing period if ENV_PREFIX is empty
         verification_link = f"http://{domain_prefix}cloudjourney.me/verify?token={verification_token}"
         logger.info(f"Constructed verification link for email: {email}")
     except Exception as e:
@@ -120,7 +135,7 @@ def lambda_handler(event, context):
         }
 
     # Send the email
-    if not send_verification_email(email, verification_link):
+    if not send_verification_email(email, verification_link, sendgrid_api_key):
         return {
             "statusCode": 500,
             "body": json.dumps({"message": "Failed to send verification email"})
